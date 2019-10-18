@@ -35,12 +35,13 @@ impl Pool {
         }))
     }
 
-    pub fn with_limit(&self, mut f: impl FnMut(&mut HashMap<TypeId, usize>)) {
-        let mut inner = self.0.lock().unwrap();
-        f(&mut inner.limit)
+   pub fn with_limit(&self, mut f: impl FnMut(&mut HashMap<TypeId, usize>)) {
+       let mut inner = self.0.lock().unwrap();
+       f(&mut inner.limit)
     }
 
     pub fn clear<T: Any>(&self) {
+        dbg!("clear");
         let tid = TypeId::of::<T>();
         let mut to_drop = Vec::new();
         {
@@ -59,19 +60,25 @@ impl Pool {
     }
 
     pub fn take_or_else<T: Any, F: FnOnce() -> T>(&'static self, f: F) -> Arc<T> {
-        {
+        let existing = {
             let tid = TypeId::of::<T>();
             let mut inner = self.0.lock().unwrap();
-            if let Some(pool) = inner.by_type.get_mut(&tid) {
-                if let Some(v) = pool.vals.pop() {
+            inner.by_type.get_mut(&tid).and_then(|pool| {
+                pool.vals.pop().map(|v| {
                     let t = unsafe {
                         mem::transmute::<usize, NonNull<ArcInner<T>>>(v)
                     };
-                    return Arc::from_inner(t);
-                }
+                    Arc::from_inner(t)
+                })
+            })
+        };
+        match existing {
+            None => Arc::new(self, f()),
+            Some(e) => {
+                e.inner().strong.fetch_add(1, Relaxed);
+                e
             }
         }
-        Arc::new(self, f())
     }
 
     fn put<T: Any>(&self, v: &Arc<T>) -> bool {
@@ -83,7 +90,7 @@ impl Pool {
             });
             if pool.vals.len() < limit && pool.clear == 0 {
                 let t = unsafe {
-                    mem::transmute::<NonNull<ArcInner<T>>, usize>(v.clone().ptr)
+                    mem::transmute::<NonNull<ArcInner<T>>, usize>(v.ptr)
                 };
                 pool.vals.push(t);
                 true
