@@ -17,7 +17,7 @@ use std::{
 //mod tests;
 struct PoolByType {
     clear: usize,
-    vals: Vec<NonNull<()>>,
+    vals: Vec<usize>,
 }
 
 struct PoolInner {
@@ -49,7 +49,7 @@ impl Pool {
                 pool.clear = pool.vals.len();
                 for v in pool.vals.drain(0..) {
                     let t = unsafe {
-                        mem::transmute::<NonNull<()>, NonNull<ArcInner<T>>>(v)
+                        mem::transmute::<usize, NonNull<ArcInner<T>>>(v)
                     };
                     to_drop.push(Arc::from_inner(t));
                 }
@@ -58,14 +58,14 @@ impl Pool {
         mem::drop(to_drop);
     }
 
-    pub fn take_or_else<T: Any>(&'static self, f: impl FnOnce() -> T) -> Arc<T> {
+    pub fn take_or_else<T: Any, F: FnOnce() -> T>(&'static self, f: F) -> Arc<T> {
         {
             let tid = TypeId::of::<T>();
             let mut inner = self.0.lock().unwrap();
             if let Some(pool) = inner.by_type.get_mut(&tid) {
                 if let Some(v) = pool.vals.pop() {
                     let t = unsafe {
-                        mem::transmute::<NonNull<()>, NonNull<ArcInner<T>>>(v)
+                        mem::transmute::<usize, NonNull<ArcInner<T>>>(v)
                     };
                     return Arc::from_inner(t);
                 }
@@ -83,7 +83,7 @@ impl Pool {
             });
             if pool.vals.len() < limit && pool.clear == 0 {
                 let t = unsafe {
-                    mem::transmute::<NonNull<ArcInner<T>>, NonNull<()>>(v.clone().ptr)
+                    mem::transmute::<NonNull<ArcInner<T>>, usize>(v.clone().ptr)
                 };
                 pool.vals.push(t);
                 true
@@ -259,15 +259,15 @@ fn is_dangling<T: ?Sized>(ptr: NonNull<T>) -> bool {
 /// counting in general.
 ///
 /// [rc_examples]: ../../std/rc/index.html#examples
-pub struct Arc<T: 'static> {
+pub struct Arc<T: Any> {
     ptr: NonNull<ArcInner<T>>,
     phantom: PhantomData<T>,
 }
 
-unsafe impl<T: Sync + Send> Send for Arc<T> {}
-unsafe impl<T: Sync + Send> Sync for Arc<T> {}
+unsafe impl<T: Sync + Send + Any> Send for Arc<T> {}
+unsafe impl<T: Sync + Send + Any> Sync for Arc<T> {}
 
-impl<T> Arc<T> {
+impl<T: Any> Arc<T> {
     fn from_inner(ptr: NonNull<ArcInner<T>>) -> Self {
         Self {
             ptr,
@@ -299,7 +299,7 @@ impl<T> Arc<T> {
 /// [`upgrade`]: struct.Weak.html#method.upgrade
 /// [`Option`]: ../../std/option/enum.Option.html
 /// [`None`]: ../../std/option/enum.Option.html#variant.None
-pub struct Weak<T: 'static> {
+pub struct Weak<T: Any> {
     // This is a `NonNull` to allow optimizing the size of this type in enums,
     // but it is not necessarily a valid pointer.
     // `Weak::new` sets this to `usize::MAX` so that it doesn’t need
@@ -308,16 +308,16 @@ pub struct Weak<T: 'static> {
     ptr: NonNull<ArcInner<T>>,
 }
 
-unsafe impl<T: Sync + Send> Send for Weak<T> {}
-unsafe impl<T: Sync + Send> Sync for Weak<T> {}
+unsafe impl<T: Sync + Send + Any> Send for Weak<T> {}
+unsafe impl<T: Sync + Send + Any> Sync for Weak<T> {}
 
-impl<T: fmt::Debug> fmt::Debug for Weak<T> {
+impl<T: fmt::Debug + Any> fmt::Debug for Weak<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "(Weak)")
     }
 }
 
-struct ArcInner<T: 'static> {
+struct ArcInner<T: Any> {
     strong: atomic::AtomicUsize,
     // the value usize::MAX acts as a sentinel for temporarily "locking" the
     // ability to upgrade weak pointers or downgrade strong ones; this is used
@@ -327,10 +327,10 @@ struct ArcInner<T: 'static> {
     data: T,
 }
 
-unsafe impl<T: Sync + Send> Send for ArcInner<T> {}
-unsafe impl<T: Sync + Send> Sync for ArcInner<T> {}
+unsafe impl<T: Sync + Send + Any> Send for ArcInner<T> {}
+unsafe impl<T: Sync + Send + Any> Sync for ArcInner<T> {}
 
-impl<T> Arc<T> {
+impl<T: Any> Arc<T> {
     /// Constructs a new `Arc<T>`.
     ///
     /// # Examples
@@ -394,7 +394,7 @@ impl<T> Arc<T> {
     }
 }
 
-impl<T> Arc<T> {
+impl<T: Any> Arc<T> {
     /// Consumes the `Arc`, returning the wrapped pointer.
     ///
     /// To avoid a memory leak the pointer must be converted back to an `Arc` using
@@ -559,7 +559,7 @@ impl<T> Arc<T> {
     }
 }
 
-impl<T> Clone for Arc<T> {
+impl<T: Any> Clone for Arc<T> {
     /// Makes a clone of the `Arc` pointer.
     ///
     /// This creates another pointer to the same inner value, increasing the
@@ -606,7 +606,7 @@ impl<T> Clone for Arc<T> {
     }
 }
 
-impl<T> Deref for Arc<T> {
+impl<T: Any> Deref for Arc<T> {
     type Target = T;
 
     #[inline]
@@ -615,7 +615,7 @@ impl<T> Deref for Arc<T> {
     }
 }
 
-impl<T: Clone> Arc<T> {
+impl<T: Clone + Any> Arc<T> {
     /// Makes a mutable reference into the given `Arc`.
     ///
     /// If there are other `Arc` or [`Weak`][weak] pointers to the same value,
@@ -702,7 +702,7 @@ impl<T: Clone> Arc<T> {
     }
 }
 
-impl<T> Arc<T> {
+impl<T: Any> Arc<T> {
     /// Returns a mutable reference to the inner value, if there are
     /// no other `Arc` or [`Weak`][weak] pointers to the same value.
     ///
@@ -778,7 +778,7 @@ impl<T> Arc<T> {
     }
 }
 
-impl<T> Drop for Arc<T> {
+impl<T: Any> Drop for Arc<T> {
     /// Drops the `Arc`.
     ///
     /// This will decrement the strong reference count. If the strong reference
@@ -857,7 +857,7 @@ impl<T> Drop for Arc<T> {
     }
 }
 
-impl<T> Weak<T> {
+impl<T: Any> Weak<T> {
     /// Attempts to upgrade the `Weak` pointer to an [`Arc`], extending
     /// the lifetime of the value if successful.
     ///
@@ -969,7 +969,7 @@ impl<T> Weak<T> {
     }
 }
 
-impl<T> Clone for Weak<T> {
+impl<T: Any> Clone for Weak<T> {
     /// Makes a clone of the `Weak` pointer that points to the same value.
     ///
     /// # Examples
@@ -1003,7 +1003,7 @@ impl<T> Clone for Weak<T> {
     }
 }
 
-impl<T> Drop for Weak<T> {
+impl<T: Any> Drop for Weak<T> {
     /// Drops the `Weak` pointer.
     ///
     /// # Examples
@@ -1055,7 +1055,7 @@ impl<T> Drop for Weak<T> {
     }
 }
 
-impl<T: PartialEq> PartialEq for Arc<T> {
+impl<T: PartialEq + Any> PartialEq for Arc<T> {
     /// Equality for two `Arc`s.
     ///
     /// Two `Arc`s are equal if their inner values are equal.
@@ -1099,7 +1099,7 @@ impl<T: PartialEq> PartialEq for Arc<T> {
     }
 }
 
-impl<T: PartialOrd> PartialOrd for Arc<T> {
+impl<T: PartialOrd + Any> PartialOrd for Arc<T> {
     /// Partial comparison for two `Arc`s.
     ///
     /// The two are compared by calling `partial_cmp()` on their inner values.
@@ -1186,7 +1186,7 @@ impl<T: PartialOrd> PartialOrd for Arc<T> {
         *(*self) >= *(*other)
     }
 }
-impl<T: Ord> Ord for Arc<T> {
+impl<T: Ord + Any> Ord for Arc<T> {
     /// Comparison for two `Arc`s.
     ///
     /// The two are compared by calling `cmp()` on their inner values.
@@ -1205,42 +1205,42 @@ impl<T: Ord> Ord for Arc<T> {
         (**self).cmp(&**other)
     }
 }
-impl<T: Eq> Eq for Arc<T> {}
+impl<T: Eq + Any> Eq for Arc<T> {}
 
-impl<T: fmt::Display> fmt::Display for Arc<T> {
+impl<T: fmt::Display + Any> fmt::Display for Arc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for Arc<T> {
+impl<T: fmt::Debug + Any> fmt::Debug for Arc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<T> fmt::Pointer for Arc<T> {
+impl<T: Any> fmt::Pointer for Arc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Pointer::fmt(&(&**self as *const T), f)
     }
 }
 
-impl<T: Hash> Hash for Arc<T> {
+impl<T: Hash + Any> Hash for Arc<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (**self).hash(state)
     }
 }
 
-impl<T> borrow::Borrow<T> for Arc<T> {
+impl<T: Any> borrow::Borrow<T> for Arc<T> {
     fn borrow(&self) -> &T {
         &**self
     }
 }
 
-impl<T> AsRef<T> for Arc<T> {
+impl<T: Any> AsRef<T> for Arc<T> {
     fn as_ref(&self) -> &T {
         &**self
     }
 }
 
-impl<T> Unpin for Arc<T> { }
+impl<T: Any> Unpin for Arc<T> { }
