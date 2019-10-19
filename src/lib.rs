@@ -30,6 +30,7 @@ fn raeify<T: Any>(ptr: usize) -> Arc<T> {
     let t = unsafe {
         mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr)
     };
+    t.inner().strong.fetch_add(1, Relaxed);
     Arc::from_inner(t)
 }
 
