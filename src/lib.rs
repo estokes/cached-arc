@@ -30,8 +30,9 @@ fn raeify<T: Any>(ptr: usize) -> Arc<T> {
     let t = unsafe {
         mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr)
     };
+    let t = Arc::from_inner(t);
     t.inner().strong.fetch_add(1, Relaxed);
-    Arc::from_inner(t)
+    t
 }
 
 pub fn clear_cache<T: Any>() {
