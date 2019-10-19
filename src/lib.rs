@@ -8,10 +8,12 @@ use std::{
     hash::{Hash, Hasher},    
     alloc::{System, GlobalAlloc, Layout},
     boxed::Box,
-    sync::Mutex,
     collections::HashMap,
     any::{TypeId, Any},
+    cell::RefCell,
 };
+
+static LIMIT: usize = 10_000;
 
 //#[cfg(test)]
 //mod tests;
@@ -20,90 +22,58 @@ struct PoolByType {
     vals: Vec<usize>,
 }
 
-struct PoolInner {
-    limit: HashMap<TypeId, usize>,
-    by_type: HashMap<TypeId, PoolByType>,
+thread_local! {
+    static POOL: RefCell<HashMap<TypeId, PoolByType>> = RefCell::new(HashMap::new());
 }
 
-pub struct Pool(Mutex<PoolInner>);
+fn raeify<T: Any>(ptr: usize) -> Arc<T> {
+    let t = unsafe {
+        mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr)
+    };
+    Arc::from_inner(t)
+}
 
-impl Pool {
-    pub fn new() -> Pool {
-        Pool(Mutex::new(PoolInner {
-            limit: HashMap::new(),
-            by_type: HashMap::new()
-        }))
-    }
-
-   pub fn with_limit(&self, mut f: impl FnMut(&mut HashMap<TypeId, usize>)) {
-       let mut inner = self.0.lock().unwrap();
-       f(&mut inner.limit)
-    }
-
-    pub fn clear<T: Any>(&self) {
-        dbg!("clear");
-        let tid = TypeId::of::<T>();
-        let mut to_drop = Vec::new();
-        {
-            let mut inner = self.0.lock().unwrap();
-            if let Some(pool) = inner.by_type.get_mut(&tid) {
-                pool.clear = pool.vals.len();
-                for v in pool.vals.drain(0..) {
-                    let t = unsafe {
-                        mem::transmute::<usize, NonNull<ArcInner<T>>>(v)
-                    };
-                    to_drop.push(Arc::from_inner(t));
-                }
+pub fn clear_cache<T: Any>() {
+    let tid = TypeId::of::<T>();
+    POOL.with(|inner| {
+        let mut inner = inner.borrow_mut();
+        if let Some(pool) = inner.get_mut(&tid) {
+            pool.clear = pool.vals.len();
+            for v in pool.vals.drain(0..) {
+                raeify::<T>(v);
             }
         }
-        mem::drop(to_drop);
-    }
+    })
+}
 
-    pub fn take_or_else<T: Any, F: FnOnce() -> T>(&'static self, f: F) -> Arc<T> {
-        let existing = {
-            let tid = TypeId::of::<T>();
-            let mut inner = self.0.lock().unwrap();
-            inner.by_type.get_mut(&tid).and_then(|pool| {
-                pool.vals.pop().map(|v| {
-                    let t = unsafe {
-                        mem::transmute::<usize, NonNull<ArcInner<T>>>(v)
-                    };
-                    Arc::from_inner(t)
-                })
-            })
-        };
-        match existing {
-            None => Arc::new(self, f()),
-            Some(e) => {
-                e.inner().strong.fetch_add(1, Relaxed);
-                e
-            }
-        }
-    }
+fn take<T: Any>() -> Option<Arc<T>> {
+    let tid = TypeId::of::<T>();
+    POOL.with(|inner| {
+        let mut inner = inner.borrow_mut();
+        inner.get_mut(&tid).and_then(|p| p.vals.pop().map(raeify::<T>))
+    })
+}
 
-    fn put<T: Any>(&self, v: &Arc<T>) -> bool {
-        let tid = TypeId::of::<T>();
-        let mut inner = self.0.lock().unwrap();
-        if let Some(limit) = inner.limit.get(&tid).copied() {
-            let mut pool = inner.by_type.entry(tid).or_insert_with(|| {
-                PoolByType { clear: 0, vals: Vec::new() }
-            });
-            if pool.vals.len() < limit && pool.clear == 0 {
-                let t = unsafe {
-                    mem::transmute::<NonNull<ArcInner<T>>, usize>(v.ptr)
-                };
-                pool.vals.push(t);
-                true
-            } else {
-                if pool.clear > 0 {
-                    pool.clear -= 1
-                }
-                false
-            }
+fn put<T: Any>(v: &Arc<T>) -> bool {
+    let tid = TypeId::of::<T>();
+    POOL.with(|inner| {
+        let mut inner = inner.borrow_mut();
+        let pool = inner.entry(tid).or_insert_with(|| {
+            PoolByType { clear: 0, vals: Vec::new() }
+        });
+        if pool.vals.len() < LIMIT && pool.clear == 0 {
+            let t = unsafe {
+                mem::transmute::<NonNull<ArcInner<T>>, usize>(v.ptr)
+            };
+            pool.vals.push(t);
+            true
         } else {
+            if pool.clear > 0 {
+                pool.clear -= 1
+            }
             false
         }
-    }
+    })
 }
 
 /// A soft limit on the amount of references that may be made to an `Arc`.
@@ -330,7 +300,6 @@ struct ArcInner<T: Any> {
     // ability to upgrade weak pointers or downgrade strong ones; this is used
     // to avoid races in `make_mut` and `get_mut`.
     weak: atomic::AtomicUsize,
-    pool: &'static Pool,
     data: T,
 }
 
@@ -348,15 +317,19 @@ impl<T: Any> Arc<T> {
     /// let five = Arc::new(5);
     /// ```
     #[inline]
-    fn new(pool: &'static Pool, data: T) -> Arc<T> {
+    pub fn new_no_cache(data: T) -> Arc<T> {
         // Start the weak pointer count as 1 which is the weak pointer that's
         // held by all the strong pointers (kinda), see std/rc.rs for more info
         let x: Box<_> = Box::new(ArcInner {
             strong: atomic::AtomicUsize::new(1),
             weak: atomic::AtomicUsize::new(1),
-            pool, data,
+            data,
         });
         Self::from_inner(NonNull::new(Box::into_raw(x)).unwrap())
+    }
+
+    pub fn new<F: FnOnce() -> T>(f: F) -> Arc<T> {
+        take::<T>().unwrap_or_else(|| Arc::new_no_cache(f()))
     }
 
     /// Returns the contained value, if the `Arc` has exactly one strong reference.
@@ -664,7 +637,7 @@ impl<T: Clone + Any> Arc<T> {
         // deallocated.
         if this.inner().strong.compare_exchange(1, 0, Acquire, Relaxed).is_err() {
             // Another strong pointer exists; clone
-            *this = Arc::new(this.inner().pool, (**this).clone());
+            *this = Arc::new_no_cache((**this).clone());
         } else if this.inner().weak.load(Relaxed) != 1 {
             // Relaxed suffices in the above because this is fundamentally an
             // optimization: we are always racing with weak pointers being
@@ -688,10 +661,7 @@ impl<T: Clone + Any> Arc<T> {
                 // here (due to zeroing) because data is no longer accessed by
                 // other threads (due to there being no more strong refs at this
                 // point).
-                let mut swap = Arc::new(
-                    this.inner().pool,
-                    ptr::read(&weak.ptr.as_ref().data)
-                );
+                let mut swap = Arc::new_no_cache(ptr::read(&weak.ptr.as_ref().data));
                 mem::swap(this, &mut swap);
                 mem::forget(swap);
             }
@@ -822,6 +792,12 @@ impl<T: Any> Drop for Arc<T> {
             return;
         }
 
+        // See if there is room in the cache for this value, if not
+        // proceed with the drop.
+        if put(self) {
+            return;
+        }
+
         // This fence is needed to prevent reordering of use of the data and
         // deletion of the data.  Because it is marked `Release`, the decreasing
         // of the reference count synchronizes with this `Acquire` fence. This
@@ -851,13 +827,7 @@ impl<T: Any> Drop for Arc<T> {
         // [1]: (www.boost.org/doc/libs/1_55_0/doc/html/atomic/usage_examples.html)
         // [2]: (https://github.com/rust-lang/rust/pull/41714)
         atomic::fence(Acquire);
-
-        // See if there is room in the cache for this value, if not
-        // proceed with the drop.
-        if self.inner().pool.put(self) {
-            return;
-        }
-
+        
         unsafe {
             self.drop_slow();
         }
