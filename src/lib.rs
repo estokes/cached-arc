@@ -13,7 +13,7 @@ use std::{
     cell::RefCell,
 };
 
-pub trait Cacheable {
+pub unsafe trait Cacheable {
     /// remove all user data from containers, and/or return the type
     /// to the state it was when it was just
     /// allocated. e.g. Vec::clear(&mut v). It is, of course, not
