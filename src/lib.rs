@@ -9,7 +9,6 @@ use std::{
     alloc::{System, GlobalAlloc, Layout},
     boxed::Box,
     collections::HashMap,
-    any::TypeId,
     cell::RefCell,
 };
 
