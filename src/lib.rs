@@ -13,6 +13,9 @@ use std::{
     cell::RefCell,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Discriminant(usize);
+
 pub unsafe trait Cacheable {
     /// remove all user data from containers, and/or return the type
     /// to the state it was when it was just
@@ -20,21 +23,10 @@ pub unsafe trait Cacheable {
     /// necessary to deallocate any memory, as long as it is cleared.
     fn reinit(&mut self);
 
-    /// return the type id + discriminant that you want to use to
-    /// classify type type. It need not be the exacty type id of this
-    /// type as long as the structure is isomorphic, and the reinit
-    /// method removes all data. This is safe or not on a case by case
-    /// basis.
-    ///
-    /// For example, consider you want to cache some Arc<ArrayVec<[T;
-    /// 512]>> types, assuming your reinit function calls clear on the
-    /// arrayvec, you can implement caching safely even if T is a non
-    /// static reference by using size_of::<T>() as the
-    /// discriminant. This is safe because your arrays are always
-    /// empty when you pull them out of the cache, so you just need to
-    /// make sure you pick one that has the correct size of T. This
-    /// saves you from needing to require T to implement Any.
-    fn type_id() -> (TypeId, usize);
+    /// return the type discriminant that you want to use to classify
+    /// the type. Each type need not have a unique discriminant, but
+    /// types that share a disciminant must by isomorphic.
+    fn type_id() -> Discriminant;
 
     /// how many arcs of this type should we cache?
     fn limit() -> usize;
@@ -52,7 +44,8 @@ struct PoolByType {
 }
 
 thread_local! {
-    static POOL: RefCell<HashMap<(TypeId, usize), PoolByType>> = RefCell::new(HashMap::new());
+    static POOL: RefCell<HashMap<Discriminant, PoolByType>> = RefCell::new(HashMap::new());
+    static NEXT_DISCRIMINANT: RefCell<usize> = RefCell::new(0);
 }
 
 fn raeify<T: Cacheable>(ptr: usize) -> Arc<T> {
@@ -60,6 +53,18 @@ fn raeify<T: Cacheable>(ptr: usize) -> Arc<T> {
     let t = Arc::from_inner(t);
     t.inner().strong.fetch_add(1, Relaxed);
     t
+}
+
+/// gets a new discriminant which is unique on this thread. You must
+/// store it in thread local storage and reuse it for each isomophic
+/// type.
+pub fn new_discriminant() -> Discriminant {
+    NEXT_DISCRIMINANT.with(|r| {
+        let mut r = r.borrow_mut();
+        let v = *r;
+        *r += 1;
+        Discriminant(v)
+    })
 }
 
 /// Drop all values of type T from the current thread's cache.
