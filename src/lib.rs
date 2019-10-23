@@ -2,7 +2,7 @@ use std::{
     borrow, fmt, mem, isize, usize,
     sync::atomic::{self, Ordering::{Acquire, Relaxed, Release, SeqCst}},
     cmp::Ordering,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     ptr::{self, NonNull},
     marker::{Unpin, PhantomData},
     hash::{Hash, Hasher},    
@@ -16,23 +16,30 @@ use std::{
 pub struct Discriminant(usize);
 
 pub unsafe trait Cacheable {
-    /// remove all user data from containers, and/or return the type
-    /// to the state it was when it was just
-    /// allocated. e.g. Vec::clear(&mut v). It is, of course, not
+    /// return the type to the state it was when it was just
+    /// allocated. e.g. Vec::clear, or similar. It is, of course, not
     /// necessary to deallocate any memory, as long as it is cleared.
     fn reinit(&mut self);
 
     /// return the type discriminant that you want to use to classify
     /// the type. Each type need not have a unique discriminant, but
-    /// types that share a disciminant must by isomorphic.
+    /// types that share a disciminant must be isomorphic, including
+    /// with respect to drop.
+    ///
+    /// for example it would be safe to return the same discriminant
+    /// for, forall<T>: Vec<T> where size_of::<T>() == usize, and
+    /// reinit() cleares the Vec, because,
+    ///
+    /// 1. the size of the Vec allocation will is the same for all Vec<T>
+    /// 
+    /// 2. the Vec is guaranteed to be empty when it is in the cache,
+    /// so no T ever needs to be dropped.
     fn type_id() -> Discriminant;
 
     /// how many arcs of this type should we cache?
     fn limit() -> usize;
 }
 
-//#[cfg(test)]
-//mod tests;
 struct PoolByType {
     clear: usize,
     // vals is a vec of pointers to the malloced arcs. we rely on the
@@ -40,15 +47,42 @@ struct PoolByType {
     // return an element from the cache and cast it to the requested
     // type.
     vals: Vec<usize>,
+    drop: Box<dyn Fn(usize) -> ()>,
+}
+
+struct Pool(HashMap<Discriminant, PoolByType>);
+
+impl Deref for Pool {
+    type Target = HashMap<Discriminant, PoolByType>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Pool {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Pool {
+    // the thread local pool will be dropped whenever a thread dies,
+    // so we need to make sure drop is called on all the cached values.
+    fn drop(&mut self) {
+        for p in self.values_mut() {
+            do_clear_cache_for(p);
+        }
+    }
 }
 
 thread_local! {
-    static POOL: RefCell<HashMap<Discriminant, PoolByType>> = RefCell::new(HashMap::new());
+    static POOL: RefCell<Pool> = RefCell::new(Pool(HashMap::new()));
     static NEXT_DISCRIMINANT: RefCell<usize> = RefCell::new(0);
 }
 
-fn raeify<T: Cacheable>(ptr: usize) -> Arc<T> {
-    let t = unsafe { mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr) };
+unsafe fn reify<T: Cacheable>(ptr: usize) -> Arc<T> {
+    let t = mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr);
     let t = Arc::from_inner(t);
     t.inner().strong.fetch_add(1, Relaxed);
     t
@@ -66,18 +100,28 @@ pub fn new_discriminant() -> Discriminant {
     })
 }
 
-/// Drop all values of type T from the current thread's cache.
-pub fn clear_cache<T: Cacheable>() {
-    let tid = T::type_id();
+fn do_clear_cache_for(pool: &mut PoolByType) {
+    pool.clear = pool.vals.len();
+    for v in pool.vals.drain(0..) {
+        (pool.drop)(v);
+    }
+}
+
+/// Drop all cached values of the specified discriminant cached by
+/// this thread.
+pub fn clear_cache_for(typ: Discriminant) {
     POOL.with(|inner| {
         let mut inner = inner.borrow_mut();
-        if let Some(pool) = inner.get_mut(&tid) {
-            pool.clear = pool.vals.len();
-            for v in pool.vals.drain(0..) {
-                mem::drop(raeify::<T>(v));
-            }
+        if let Some(pool) = inner.get_mut(&typ) {
+            do_clear_cache_for(pool);
         }
     })
+}
+
+/// Drop all the values of all discriminants cached by this thread
+pub fn clear_cache() {
+    POOL.with(|p| p.borrow().iter().map(|(k, _)| *k).collect::<Vec<_>>())
+        .into_iter().for_each(|d| clear_cache_for(d));
 }
 
 // Take a value of type T from the cache if one is available.
@@ -85,7 +129,7 @@ fn take<T: Cacheable>() -> Option<Arc<T>> {
     let tid = T::type_id();
     POOL.with(|inner| {
         let mut inner = inner.borrow_mut();
-        inner.get_mut(&tid).and_then(|p| p.vals.pop().map(raeify::<T>))
+        inner.get_mut(&tid).and_then(|p| p.vals.pop().map(|p| unsafe { reify::<T>(p) }))
     })
 }
 
@@ -95,8 +139,10 @@ fn try_put<T: Cacheable>(v: &mut Arc<T>) -> bool {
     let tid = T::type_id();
     POOL.with(|inner| {
         let mut inner = inner.borrow_mut();
-        let pool = inner.entry(tid).or_insert_with(|| {
-            PoolByType { clear: 0, vals: Vec::new() }
+        let pool = inner.entry(tid).or_insert_with(|| PoolByType {
+            clear: 0,
+            vals: Vec::new(),
+            drop: Box::new(|p| unsafe { mem::drop(reify::<T>(p)) }),
         });
         if pool.vals.len() < T::limit() && pool.clear == 0 {
             unsafe { T::reinit(Arc::get_mut_unchecked(v)); }
