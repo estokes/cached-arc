@@ -146,6 +146,9 @@ fn try_put<T: Cacheable>(v: &mut Arc<T>) -> bool {
         if pool.vals.len() < T::limit() {
             unsafe { T::reinit(Arc::get_mut_unchecked(v)); }
             let t = unsafe { mem::transmute::<NonNull<ArcInner<T>>, usize>(v.ptr) };
+            for v in &pool.vals {
+                assert!(v != &t);
+            }
             pool.vals.push(t);
             true
         } else {
