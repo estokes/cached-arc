@@ -19,6 +19,8 @@ pub unsafe trait Cacheable {
     /// return the type to the state it was when it was just
     /// allocated. e.g. Vec::clear, or similar. It is, of course, not
     /// necessary to deallocate any memory, as long as it is cleared.
+    /// reinit must not clone, or otherwise store any references to
+    /// the cached value!
     fn reinit(&mut self);
 
     /// return the type discriminant that you want to use to classify
@@ -41,7 +43,6 @@ pub unsafe trait Cacheable {
 }
 
 struct PoolByType {
-    clear: usize,
     // vals is a vec of pointers to the malloced arcs. we rely on the
     // typeid to ensure we return an isomorphic structure when we
     // return an element from the cache and cast it to the requested
@@ -81,13 +82,6 @@ thread_local! {
     static NEXT_DISCRIMINANT: RefCell<usize> = RefCell::new(0);
 }
 
-unsafe fn reify<T: Cacheable>(ptr: usize) -> Arc<T> {
-    let t = mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr);
-    let t = Arc::from_inner(t);
-    t.inner().strong.fetch_add(1, Relaxed);
-    t
-}
-
 /// gets a new discriminant which is unique on this thread. You must
 /// store it in thread local storage and reuse it for each isomophic
 /// type.
@@ -101,10 +95,7 @@ pub fn new_discriminant() -> Discriminant {
 }
 
 fn do_clear_cache_for(pool: &mut PoolByType) {
-    pool.clear = pool.vals.len();
-    for v in pool.vals.drain(0..) {
-        (pool.drop)(v);
-    }
+    pool.vals.drain(0..).for_each(&*pool.drop)
 }
 
 /// Drop all cached values of the specified discriminant cached by
@@ -129,7 +120,12 @@ fn take<T: Cacheable>() -> Option<Arc<T>> {
     let tid = T::type_id();
     POOL.with(|inner| {
         let mut inner = inner.borrow_mut();
-        inner.get_mut(&tid).and_then(|p| p.vals.pop().map(|p| unsafe { reify::<T>(p) }))
+        inner.get_mut(&tid).and_then(|p| p.vals.pop().map(|ptr| unsafe {
+            let t = mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr);
+            let t = Arc::from_inner(t);
+            t.inner().strong.fetch_add(1, Relaxed);
+            t
+        }))
     })
 }
 
@@ -140,19 +136,19 @@ fn try_put<T: Cacheable>(v: &mut Arc<T>) -> bool {
     POOL.with(|inner| {
         let mut inner = inner.borrow_mut();
         let pool = inner.entry(tid).or_insert_with(|| PoolByType {
-            clear: 0,
             vals: Vec::new(),
-            drop: Box::new(|p| unsafe { mem::drop(reify::<T>(p)) }),
+            drop: Box::new(|ptr| unsafe {
+                let t = mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr);
+                let mut t = Arc::from_inner(t);
+                t.drop_slow();
+            }),
         });
-        if pool.vals.len() < T::limit() && pool.clear == 0 {
+        if pool.vals.len() < T::limit() {
             unsafe { T::reinit(Arc::get_mut_unchecked(v)); }
             let t = unsafe { mem::transmute::<NonNull<ArcInner<T>>, usize>(v.ptr) };
             pool.vals.push(t);
             true
         } else {
-            if pool.clear > 0 {
-                pool.clear -= 1
-            }
             false
         }
     })
