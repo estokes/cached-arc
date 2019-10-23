@@ -2,7 +2,7 @@ use std::{
     borrow, fmt, mem, isize, usize,
     sync::atomic::{self, Ordering::{Acquire, Relaxed, Release, SeqCst}},
     cmp::Ordering,
-    ops::{Deref, DerefMut},
+    ops::Deref,
     ptr::{self, NonNull},
     marker::{Unpin, PhantomData},
     hash::{Hash, Hasher},    
@@ -51,34 +51,14 @@ struct PoolByType {
     drop: Box<dyn Fn(usize) -> ()>,
 }
 
-struct Pool(HashMap<Discriminant, PoolByType>);
-
-impl Deref for Pool {
-    type Target = HashMap<Discriminant, PoolByType>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for Pool {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Drop for Pool {
-    // the thread local pool will be dropped whenever a thread dies,
-    // so we need to make sure drop is called on all the cached values.
+impl Drop for PoolByType {
     fn drop(&mut self) {
-        for p in self.values_mut() {
-            do_clear_cache_for(p);
-        }
+        self.vals.drain(0..).for_each(&*self.drop);
     }
 }
 
 thread_local! {
-    static POOL: RefCell<Pool> = RefCell::new(Pool(HashMap::new()));
+    static POOL: RefCell<HashMap<Discriminant, PoolByType>> = RefCell::new(HashMap::new());
     static NEXT_DISCRIMINANT: RefCell<usize> = RefCell::new(0);
 }
 
@@ -94,25 +74,15 @@ pub fn new_discriminant() -> Discriminant {
     })
 }
 
-fn do_clear_cache_for(pool: &mut PoolByType) {
-    pool.vals.drain(0..).for_each(&*pool.drop)
-}
-
 /// Drop all cached values of the specified discriminant cached by
 /// this thread.
 pub fn clear_cache_for(typ: Discriminant) {
-    POOL.with(|inner| {
-        let mut inner = inner.borrow_mut();
-        if let Some(pool) = inner.get_mut(&typ) {
-            do_clear_cache_for(pool);
-        }
-    })
+    POOL.with(|p| p.borrow_mut().remove(&typ));
 }
 
 /// Drop all the values of all discriminants cached by this thread
 pub fn clear_cache() {
-    POOL.with(|p| p.borrow().iter().map(|(k, _)| *k).collect::<Vec<_>>())
-        .into_iter().for_each(|d| clear_cache_for(d));
+    POOL.with(|p| p.borrow_mut().clear());
 }
 
 // Take a value of type T from the cache if one is available.
@@ -122,8 +92,8 @@ fn take<T: Cacheable>() -> Option<Arc<T>> {
         let mut inner = inner.borrow_mut();
         inner.get_mut(&tid).and_then(|p| p.vals.pop().map(|ptr| unsafe {
             let t = mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr);
-            let t = Arc::from_inner(t);
-            t.inner().strong.fetch_add(1, Relaxed);
+            let mut t = Arc::from_inner(t);
+            assert!(t.is_unique());
             t
         }))
     })
@@ -138,18 +108,18 @@ fn try_put<T: Cacheable>(v: &mut Arc<T>) -> bool {
         let pool = inner.entry(tid).or_insert_with(|| PoolByType {
             vals: Vec::new(),
             drop: Box::new(|ptr| unsafe {
-                let t = mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr);
-                let mut t = Arc::from_inner(t);
-                t.drop_slow();
+                let ptr = mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr);
+                let mut t = Arc::from_inner(ptr);
+                Arc::drop_slow(&mut t);
+                mem::forget(t);
             }),
         });
         if pool.vals.len() < T::limit() {
+            v.inner().strong.fetch_add(1, Relaxed);
             unsafe { T::reinit(Arc::get_mut_unchecked(v)); }
-            let t = unsafe { mem::transmute::<NonNull<ArcInner<T>>, usize>(v.ptr) };
-            for v in &pool.vals {
-                assert!(v != &t);
-            }
-            pool.vals.push(t);
+            pool.vals.push(unsafe {
+                mem::transmute::<NonNull<ArcInner<T>>, usize>(v.ptr)
+            });
             true
         } else {
             false
@@ -314,7 +284,6 @@ impl<T: Cacheable> Arc<T> {
         unsafe { self.ptr.as_ref() }
     }
 
-    // Non-inlined part of `drop`.
     #[inline(never)]
     unsafe fn drop_slow(&mut self) {
         // Destroy the data at this time, even though we may not free the box
