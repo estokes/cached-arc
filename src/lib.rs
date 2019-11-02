@@ -21,7 +21,10 @@ pub unsafe trait Cacheable {
     /// necessary to deallocate any memory, as long as it is cleared.
     /// reinit must not clone, or otherwise store any references to
     /// the cached value!
-    fn reinit(&mut self);
+    ///
+    /// The value will only be kept if reinit returns true, otherwise
+    /// it will be thrown away.
+    fn reinit(&mut self) -> bool;
 
     /// return the type discriminant that you want to use to classify
     /// the type. Each type need not have a unique discriminant, but
@@ -58,7 +61,8 @@ impl Drop for PoolByType {
 }
 
 thread_local! {
-    static POOL: RefCell<HashMap<Discriminant, PoolByType>> = RefCell::new(HashMap::new());
+    static POOL: RefCell<HashMap<Discriminant, PoolByType>> =
+        RefCell::new(HashMap::new());
     static NEXT_DISCRIMINANT: RefCell<usize> = RefCell::new(0);
 }
 
@@ -102,29 +106,31 @@ fn take<T: Cacheable>() -> Option<Arc<T>> {
 // try to add an arc to the cache, return true if it was added, false
 // if it wasn't.
 fn try_put<T: Cacheable>(v: &mut Arc<T>) -> bool {
-    let tid = T::type_id();
-    POOL.with(|inner| {
-        let mut inner = inner.borrow_mut();
-        let pool = inner.entry(tid).or_insert_with(|| PoolByType {
-            vals: Vec::new(),
-            drop: Box::new(|ptr| unsafe {
-                let ptr = mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr);
-                let mut t = Arc::from_inner(ptr);
-                Arc::drop_slow(&mut t);
-                mem::forget(t);
-            }),
-        });
-        if pool.vals.len() < T::limit() {
-            v.inner().strong.fetch_add(1, Relaxed);
-            unsafe { T::reinit(Arc::get_mut_unchecked(v)); }
-            pool.vals.push(unsafe {
-                mem::transmute::<NonNull<ArcInner<T>>, usize>(v.ptr)
+    let keep = unsafe { T::reinit(Arc::get_mut_unchecked(v)) };
+    keep && {
+        let tid = T::type_id();
+        POOL.with(|inner| {
+            let mut inner = inner.borrow_mut();
+            let pool = inner.entry(tid).or_insert_with(|| PoolByType {
+                vals: Vec::new(),
+                drop: Box::new(|ptr| unsafe {
+                    let ptr = mem::transmute::<usize, NonNull<ArcInner<T>>>(ptr);
+                    let mut t = Arc::from_inner(ptr);
+                    Arc::drop_slow(&mut t);
+                    mem::forget(t);
+                }),
             });
-            true
-        } else {
-            false
-        }
-    })
+            if pool.vals.len() < T::limit() {
+                v.inner().strong.fetch_add(1, Relaxed);
+                pool.vals.push(unsafe {
+                    mem::transmute::<NonNull<ArcInner<T>>, usize>(v.ptr)
+                });
+                true
+            } else {
+                false
+            }
+        })
+    }
 }
 
 const MAX_REFCOUNT: usize = (isize::MAX) as usize;
